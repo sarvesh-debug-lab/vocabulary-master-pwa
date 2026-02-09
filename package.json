@@ -1,6 +1,6 @@
 {
   "name": "vocabulary-master",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "An intelligent vocabulary learning application with spaced repetition",
   "private": true,
   "type": "module",
@@ -11,7 +11,7 @@
     "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix --ignore-path .gitignore",
     "type-check": "vue-tsc --noEmit",
     "test": "vitest",
-    "test:ui": "vitest --ui"
+    "test:ui": "vitest --ui",
     "format": "prettier --write \"src/**/*.{vue,js,ts,json,css}\""
   },
   "dependencies": {
@@ -71,4 +71,4 @@
     "url": "https://github.com/your-username/vocabulary-master/issues"
   },
   "homepage": "https://github.com/your-username/vocabulary-master#readme"
-  }
+}
