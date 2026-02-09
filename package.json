@@ -11,7 +11,7 @@
     "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix --ignore-path .gitignore",
     "type-check": "vue-tsc --noEmit",
     "test": "vitest",
-    "test:ui": "vitest --ui",
+    "test:ui": "vitest --ui"
     "format": "prettier --write \"src/**/*.{vue,js,ts,json,css}\""
   },
   "dependencies": {
