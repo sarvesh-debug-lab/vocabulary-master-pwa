@@ -1,816 +1,423 @@
-// src/services/storage.service.ts
-import { z } from 'zod'
-import type { VocabularyWord, StudySession, AppSettings } from '@/types'
+// src/services/spacedRepetition.ts
+import type { VocabularyWord } from '@/types'
 
-// Constants
-const STORAGE_KEYS = {
-  WORDS: 'vocabulary-master_words_v1',
-  SESSIONS: 'vocabulary-master_sessions_v1',
-  SETTINGS: 'vocabulary-master_settings_v1',
-  META: 'vocabulary-master_meta_v1'
-} as const
-
-const STORAGE_VERSION = 1
-const MAX_STORAGE_SIZE = 5 * 1024 * 1024 // 5MB
-const DEBOUNCE_DELAY = 500 // ms
-
-// Schema validation
-const VocabularyWordSchema = z.object({
-  id: z.string().uuid(),
-  word: z.string().min(1).max(100),
-  phonetic: z.string().optional(),
-  meaning: z.string().min(1),
-  definitions: z.array(z.string()),
-  examples: z.array(z.string()),
-  synonyms: z.array(z.string()),
-  antonyms: z.array(z.string()),
-  tags: z.array(z.string()),
-  difficulty: z.enum(['beginner', 'intermediate', 'advanced', 'master']),
-  notes: z.string().optional(),
-  imageUrl: z.string().optional(),
-  audioUrl: z.string().optional(),
-  createdAt: z.string().datetime(),
-  updatedAt: z.string().datetime(),
-  lastReviewedAt: z.string().datetime().optional(),
-  reviewCount: z.number().int().min(0),
-  nextReviewAt: z.string().datetime(),
-  interval: z.number().min(0),
-  easeFactor: z.number().min(1.3).max(2.5),
-  masteryScore: z.number().min(0).max(100),
-  isStarred: z.boolean(),
-  isArchived: z.boolean()
-})
-
-const StudySessionSchema = z.object({
-  id: z.string().uuid(),
-  mode: z.enum(['flashcard', 'quiz', 'typing', 'matching']),
-  duration: z.number().min(0),
-  totalCards: z.number().min(0),
-  correctAnswers: z.number().min(0),
-  accuracy: z.number().min(0).max(1),
-  completedAt: z.string().datetime(),
-  wordIds: z.array(z.string().uuid())
-})
-
-const AppSettingsSchema = z.object({
-  version: z.number(),
-  darkMode: z.boolean(),
-  dailyGoal: z.number().min(1).max(100),
-  enableNotifications: z.boolean(),
-  autoPlayAudio: z.boolean(),
-  defaultMode: z.enum(['flashcard', 'quiz', 'typing', 'matching']),
-  showHints: z.boolean(),
-  difficultyFilter: z.array(z.enum(['beginner', 'intermediate', 'advanced', 'master'])),
-  tagsFilter: z.array(z.string()),
-  lastSyncAt: z.string().datetime().optional(),
-  streak: z.number().min(0)
-})
-
-export class StorageService {
-  private static instance: StorageService
-  private cache = new Map<string, any>()
-  private writeQueue = new Map<string, any>()
-  private writeTimeout: ReturnType<typeof setTimeout> | null = null
-
-  private constructor() {
-    this.initializeStorage()
-    this.setupCrossTabSync()
-  }
-
-  static getInstance(): StorageService {
-    if (!StorageService.instance) {
-      StorageService.instance = new StorageService()
-    }
-    return StorageService.instance
-  }
-
-  // ==================== INITIALIZATION ====================
+export class SpacedRepetitionService {
+  private static readonly MIN_EASE_FACTOR = 1.3
+  private static readonly MAX_EASE_FACTOR = 2.5
+  private static readonly INITIAL_EASE_FACTOR = 2.5
+  private static readonly MASTERY_INCREMENT = 20 // Points added for correct answer
   
-  private initializeStorage(): void {
-    try {
-      // Check if storage is available
-      if (!this.isLocalStorageAvailable()) {
-        throw new Error('LocalStorage is not available')
-      }
-
-      // Initialize meta data
-      const meta = this.getMetaData()
-      if (meta.version !== STORAGE_VERSION) {
-        this.migrateData(meta.version)
-      }
-
-      // Initialize default data if empty
-      if (!this.getRaw(STORAGE_KEYS.WORDS)) {
-        this.setRaw(STORAGE_KEYS.WORDS, [])
-      }
-
-      if (!this.getRaw(STORAGE_KEYS.SESSIONS)) {
-        this.setRaw(STORAGE_KEYS.SESSIONS, [])
-      }
-
-      if (!this.getRaw(STORAGE_KEYS.SETTINGS)) {
-        this.setRaw(STORAGE_KEYS.SETTINGS, {
-          version: STORAGE_VERSION,
-          darkMode: false,
-          dailyGoal: 20,
-          enableNotifications: true,
-          autoPlayAudio: false,
-          defaultMode: 'flashcard',
-          showHints: true,
-          difficultyFilter: ['beginner', 'intermediate', 'advanced'],
-          tagsFilter: [],
-          streak: 0
-        })
-      }
-
-      // Check storage health
-      this.checkStorageHealth()
-    } catch (error) {
-      console.error('Failed to initialize storage:', error)
-      this.recoverFromCorruption()
+  /**
+   * SM-2 Spaced Repetition Algorithm Implementation
+   * Quality ratings:
+   * 5: Perfect response
+   * 4: Correct response after hesitation
+   * 3: Correct response recalled with serious difficulty
+   * 2: Incorrect response; where the correct one seemed easy to recall
+   * 1: Incorrect response; the correct one remembered
+   * 0: Complete blackout
+   */
+  static calculateNextReview(
+    card: VocabularyWord,
+    quality: 0 | 1 | 2 | 3 | 4 | 5
+  ): Pick<VocabularyWord, 
+    'interval' | 'easeFactor' | 'reviewCount' | 'masteryScore' | 
+    'nextReviewAt' | 'lastReviewedAt'
+  > {
+    // Validate input
+    if (quality < 0 || quality > 5) {
+      throw new Error('Quality rating must be between 0 and 5')
     }
-  }
 
-  private setupCrossTabSync(): void {
-    if (typeof window !== 'undefined') {
-      window.addEventListener('storage', (event) => {
-        if (Object.values(STORAGE_KEYS).includes(event.key as any)) {
-          // Invalidate cache for this key
-          this.cache.delete(event.key!)
-          
-          // Notify listeners
-          this.notifyChange(event.key!)
-        }
-      })
+    if (card.masteryScore < 0 || card.masteryScore > 100) {
+      throw new Error('Mastery score must be between 0 and 100')
     }
-  }
 
-  private notifyChange(key: string): void {
-    // You can implement custom event dispatching here
-    // For example, using a custom event or callback system
-    const event = new CustomEvent('storageUpdated', { 
-      detail: { key, timestamp: Date.now() } 
-    })
-    window.dispatchEvent(event)
-  }
-
-  // ==================== PUBLIC API ====================
-
-  // Words CRUD Operations
-  getAllWords(): VocabularyWord[] {
-    return this.getWithValidation(STORAGE_KEYS.WORDS, VocabularyWordSchema.array(), [])
-  }
-
-  getWordById(id: string): VocabularyWord | null {
-    const words = this.getAllWords()
-    return words.find(word => word.id === id) || null
-  }
-
-  getWordsBy(filter: {
-    difficulty?: string[]
-    tags?: string[]
-    isArchived?: boolean
-    isStarred?: boolean
-    searchQuery?: string
-    minMastery?: number
-    maxMastery?: number
-  } = {}): VocabularyWord[] {
-    const words = this.getAllWords()
+    // Clone the card to avoid mutations
+    const currentCard = { ...card }
     
-    return words.filter(word => {
-      // Filter by archived status
-      if (filter.isArchived !== undefined && word.isArchived !== filter.isArchived) {
-        return false
+    let newInterval: number
+    let newEaseFactor: number
+    let newReviewCount: number
+
+    // SM-2 Algorithm
+    if (quality < 3) {
+      // Incorrect response - reset interval
+      newInterval = 1
+      newReviewCount = 0
+    } else {
+      // Correct response
+      if (currentCard.reviewCount === 0) {
+        newInterval = 1
+      } else if (currentCard.reviewCount === 1) {
+        newInterval = 6
+      } else {
+        newInterval = Math.round(currentCard.interval * currentCard.easeFactor)
       }
-
-      // Filter by starred status
-      if (filter.isStarred !== undefined && word.isStarred !== filter.isStarred) {
-        return false
-      }
-
-      // Filter by difficulty
-      if (filter.difficulty?.length && !filter.difficulty.includes(word.difficulty)) {
-        return false
-      }
-
-      // Filter by tags
-      if (filter.tags?.length && !word.tags.some(tag => filter.tags!.includes(tag))) {
-        return false
-      }
-
-      // Filter by mastery range
-      if (filter.minMastery !== undefined && word.masteryScore < filter.minMastery) {
-        return false
-      }
-
-      if (filter.maxMastery !== undefined && word.masteryScore > filter.maxMastery) {
-        return false
-      }
-
-      // Filter by search query
-      if (filter.searchQuery) {
-        const query = filter.searchQuery.toLowerCase()
-        const matches = 
-          word.word.toLowerCase().includes(query) ||
-          word.meaning.toLowerCase().includes(query) ||
-          word.definitions.some(def => def.toLowerCase().includes(query)) ||
-          word.tags.some(tag => tag.toLowerCase().includes(query))
-        
-        if (!matches) return false
-      }
-
-      return true
-    })
-  }
-
-  getWordsDueForReview(limit: number = 100): VocabularyWord[] {
-    const words = this.getAllWords()
-    const now = new Date().toISOString()
-    
-    return words
-      .filter(word => !word.isArchived && word.nextReviewAt <= now)
-      .sort((a, b) => {
-        // Sort by priority: overdue first, then by mastery (lowest first)
-        const aOverdue = new Date(a.nextReviewAt).getTime() - new Date().getTime()
-        const bOverdue = new Date(b.nextReviewAt).getTime() - new Date().getTime()
-        
-        if (aOverdue < 0 && bOverdue >= 0) return -1
-        if (bOverdue < 0 && aOverdue >= 0) return 1
-        
-        return a.masteryScore - b.masteryScore
-      })
-      .slice(0, limit)
-  }
-
-  addWord(wordData: Omit<VocabularyWord, 'id' | 'createdAt' | 'updatedAt'>): string {
-    const newWord: VocabularyWord = {
-      ...wordData,
-      id: crypto.randomUUID(),
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      newReviewCount = currentCard.reviewCount + 1
     }
 
-    // Validate the word
-    const result = VocabularyWordSchema.safeParse(newWord)
-    if (!result.success) {
-      throw new Error(`Invalid word data: ${result.error.message}`)
-    }
+    // Calculate new ease factor with bounds
+    const easeFactorChange = this.calculateEaseFactorChange(quality)
+    newEaseFactor = currentCard.easeFactor + easeFactorChange
+    newEaseFactor = this.clampEaseFactor(newEaseFactor)
 
-    const words = this.getAllWords()
-    
-    // Check for duplicates (case-insensitive, ignoring spaces)
-    const normalizedWord = newWord.word.toLowerCase().trim()
-    const exists = words.some(w => 
-      w.word.toLowerCase().trim() === normalizedWord && !w.isArchived
+    // Calculate mastery score with adaptive increment
+    const masteryIncrement = this.calculateMasteryIncrement(quality, currentCard.masteryScore)
+    const newMasteryScore = Math.min(
+      100,
+      Math.max(0, currentCard.masteryScore + masteryIncrement)
     )
-    
-    if (exists) {
-      throw new Error('Word already exists in your vocabulary')
-    }
 
-    words.push(newWord)
-    this.setWords(words)
-    
-    return newWord.id
-  }
-
-  updateWord(id: string, updates: Partial<VocabularyWord>): void {
-    const words = this.getAllWords()
-    const index = words.findIndex(w => w.id === id)
-    
-    if (index === -1) {
-      throw new Error('Word not found')
-    }
-
-    const updatedWord = {
-      ...words[index],
-      ...updates,
-      updatedAt: new Date().toISOString()
-    }
-
-    // Validate the updated word
-    const result = VocabularyWordSchema.safeParse(updatedWord)
-    if (!result.success) {
-      throw new Error(`Invalid word data: ${result.error.message}`)
-    }
-
-    words[index] = updatedWord
-    this.setWords(words)
-  }
-
-  deleteWord(id: string): void {
-    const words = this.getAllWords()
-    const filteredWords = words.filter(w => w.id !== id)
-    
-    if (filteredWords.length === words.length) {
-      throw new Error('Word not found')
-    }
-
-    this.setWords(filteredWords)
-  }
-
-  // Sessions CRUD Operations
-  getAllSessions(limit?: number): StudySession[] {
-    const sessions = this.getWithValidation(STORAGE_KEYS.SESSIONS, StudySessionSchema.array(), [])
-    return limit ? sessions.slice(0, limit) : sessions
-  }
-
-  addSession(session: Omit<StudySession, 'id'>): string {
-    const newSession: StudySession = {
-      ...session,
-      id: crypto.randomUUID()
-    }
-
-    const result = StudySessionSchema.safeParse(newSession)
-    if (!result.success) {
-      throw new Error(`Invalid session data: ${result.error.message}`)
-    }
-
-    const sessions = this.getAllSessions()
-    sessions.unshift(newSession)
-    
-    // Keep only recent sessions for performance
-    const trimmedSessions = sessions.slice(0, 100)
-    this.setRaw(STORAGE_KEYS.SESSIONS, trimmedSessions)
-    
-    return newSession.id
-  }
-
-  // Settings Operations
-  getSettings(): AppSettings {
-    return this.getWithValidation(STORAGE_KEYS.SETTINGS, AppSettingsSchema, {
-      version: STORAGE_VERSION,
-      darkMode: false,
-      dailyGoal: 20,
-      enableNotifications: true,
-      autoPlayAudio: false,
-      defaultMode: 'flashcard',
-      showHints: true,
-      difficultyFilter: ['beginner', 'intermediate', 'advanced'],
-      tagsFilter: [],
-      streak: 0
-    })
-  }
-
-  updateSettings(updates: Partial<AppSettings>): void {
-    const settings = this.getSettings()
-    const updatedSettings = { ...settings, ...updates }
-    
-    // Validate updated settings
-    const result = AppSettingsSchema.safeParse(updatedSettings)
-    if (!result.success) {
-      throw new Error(`Invalid settings data: ${result.error.message}`)
-    }
-    
-    this.setRaw(STORAGE_KEYS.SETTINGS, updatedSettings)
-  }
-
-  // ==================== UTILITY METHODS ====================
-
-  private getWithValidation<T>(key: string, schema: z.ZodSchema<T>, defaultValue: T): T {
-    try {
-      const raw = this.getRaw(key)
-      if (!raw) return defaultValue
-      
-      const result = schema.safeParse(raw)
-      if (!result.success) {
-        console.warn(`Invalid data format for ${key}:`, result.error.format())
-        this.handleCorruption(key, defaultValue)
-        return defaultValue
-      }
-      
-      return result.data
-    } catch (error) {
-      console.error(`Failed to get ${key}:`, error)
-      return defaultValue
-    }
-  }
-
-  private getRaw(key: string): any {
-    // Check cache first
-    if (this.cache.has(key)) {
-      return this.cache.get(key)
-    }
-
-    try {
-      const item = localStorage.getItem(key)
-      if (!item) return null
-
-      const parsed = JSON.parse(item)
-      this.cache.set(key, parsed)
-      return parsed
-    } catch (error) {
-      console.error(`Failed to parse ${key}:`, error)
-      this.handleCorruption(key, null)
-      return null
-    }
-  }
-
-  private setRaw(key: string, value: any): void {
-    try {
-      // Queue the write for debouncing
-      this.writeQueue.set(key, value)
-      this.scheduleWrite()
-      
-      // Update cache immediately for synchronous reads
-      this.cache.set(key, value)
-    } catch (error) {
-      console.error(`Failed to set ${key}:`, error)
-      this.checkStorageSize()
-    }
-  }
-
-  private setWords(words: VocabularyWord[]): void {
-    this.setRaw(STORAGE_KEYS.WORDS, words)
-  }
-
-  private scheduleWrite(): void {
-    if (this.writeTimeout) {
-      clearTimeout(this.writeTimeout)
-    }
-
-    this.writeTimeout = setTimeout(() => {
-      this.flushWriteQueue()
-    }, DEBOUNCE_DELAY)
-  }
-
-  private flushWriteQueue(): void {
-    try {
-      this.writeQueue.forEach((value, key) => {
-        localStorage.setItem(key, JSON.stringify(value))
-      })
-      this.writeQueue.clear()
-    } catch (error) {
-      console.error('Failed to write to localStorage:', error)
-      this.checkStorageSize()
-    }
-  }
-
-  // ==================== MIGRATION & RECOVERY ====================
-
-  private getMetaData(): { version: number; lastMigration?: string } {
-    try {
-      const meta = this.getRaw(STORAGE_KEYS.META)
-      return meta || { version: 1 }
-    } catch (error) {
-      return { version: 1 }
-    }
-  }
-
-  private migrateData(oldVersion: number): void {
-    console.log(`Migrating data from version ${oldVersion} to ${STORAGE_VERSION}`)
-    
-    // Currently only one version, but structure is ready for future migrations
-    if (oldVersion < STORAGE_VERSION) {
-      // Example: Migrate from version 1 to 2
-      // const oldWords = this.getRaw('vocabulary-master_words_v1')
-      // if (oldWords && Array.isArray(oldWords)) {
-      //   const migratedWords = oldWords.map((word: any) => ({
-      //     ...word,
-      //     newField: 'defaultValue'
-      //   }))
-      //   this.setRaw(STORAGE_KEYS.WORDS, migratedWords)
-      // }
-    }
-
-    // Update meta version
-    this.setRaw(STORAGE_KEYS.META, {
-      version: STORAGE_VERSION,
-      lastMigration: new Date().toISOString()
-    })
-  }
-
-  // ==================== SAFETY & RECOVERY ====================
-
-  private isLocalStorageAvailable(): boolean {
-    try {
-      const testKey = '__test__'
-      localStorage.setItem(testKey, testKey)
-      localStorage.removeItem(testKey)
-      return true
-    } catch (error) {
-      return false
-    }
-  }
-
-  private checkStorageHealth(): void {
-    this.checkStorageSize()
-    this.validateAllData()
-  }
-
-  private checkStorageSize(): void {
-    try {
-      let totalSize = 0
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i)
-        if (key && key.startsWith('vocabulary-master_')) {
-          const value = localStorage.getItem(key)
-          totalSize += (key.length + (value?.length || 0)) * 2 // UTF-16
-        }
-      }
-
-      const usedPercentage = (totalSize / MAX_STORAGE_SIZE) * 100
-      
-      if (usedPercentage > 90) {
-        console.error('Storage almost full!')
-        this.cleanupOldData()
-      } else if (usedPercentage > 70) {
-        console.warn(`Storage usage is high: ${Math.round(usedPercentage)}%`)
-      }
-    } catch (error) {
-      console.error('Failed to check storage size:', error)
-    }
-  }
-
-  private cleanupOldData(): void {
-    try {
-      // Clean up old sessions (keep only last 50)
-      const sessions = this.getAllSessions()
-      if (sessions.length > 50) {
-        this.setRaw(STORAGE_KEYS.SESSIONS, sessions.slice(0, 50))
-      }
-
-      // Archive old completed words with high mastery
-      const words = this.getAllWords()
-      const now = new Date()
-      const sixMonthsAgo = new Date(now.setMonth(now.getMonth() - 6))
-      
-      const wordsToArchive = words.filter(word => 
-        !word.isArchived && 
-        word.masteryScore >= 90 && 
-        word.lastReviewedAt && 
-        new Date(word.lastReviewedAt) < sixMonthsAgo
-      )
-      
-      if (wordsToArchive.length > 0) {
-        wordsToArchive.forEach(word => {
-          this.updateWord(word.id, { isArchived: true })
-        })
-        console.log(`Archived ${wordsToArchive.length} old mastered words`)
-      }
-    } catch (error) {
-      console.error('Failed to cleanup old data:', error)
-    }
-  }
-
-  private validateAllData(): void {
-    try {
-      // Validate all stored data
-      this.getAllWords()
-      this.getAllSessions()
-      this.getSettings()
-    } catch (error) {
-      console.warn('Data validation found issues:', error)
-    }
-  }
-
-  private handleCorruption(key: string, defaultValue: any): void {
-    console.warn(`Handling corrupted data for key: ${key}`)
-    
-    try {
-      // Try to backup corrupted data before overwriting
-      const corrupted = localStorage.getItem(key)
-      if (corrupted) {
-        const backupKey = `${key}_corrupted_backup_${Date.now()}`
-        localStorage.setItem(backupKey, corrupted)
-        console.log(`Backed up corrupted data to: ${backupKey}`)
-      }
-      
-      // Set default value
-      localStorage.setItem(key, JSON.stringify(defaultValue))
-      this.cache.delete(key)
-      
-      console.log(`Restored ${key} to default value`)
-    } catch (error) {
-      console.error('Failed to handle corruption:', error)
-    }
-  }
-
-  private recoverFromCorruption(): void {
-    console.log('Attempting to recover from storage corruption...')
-    
-    try {
-      // Clear only app data
-      Object.values(STORAGE_KEYS).forEach(key => {
-        localStorage.removeItem(key)
-      })
-      this.cache.clear()
-      this.writeQueue.clear()
-      
-      if (this.writeTimeout) {
-        clearTimeout(this.writeTimeout)
-      }
-      
-      // Reinitialize
-      this.initializeStorage()
-      console.log('Recovery successful')
-    } catch (error) {
-      console.error('Recovery failed:', error)
-      throw new Error('Storage corruption recovery failed. Please refresh the app.')
-    }
-  }
-
-  // ==================== BULK OPERATIONS ====================
-
-  exportData(): string {
-    const data = {
-      version: STORAGE_VERSION,
-      exportedAt: new Date().toISOString(),
-      app: 'Vocabulary Master',
-      data: {
-        words: this.getAllWords(),
-        sessions: this.getAllSessions(),
-        settings: this.getSettings()
-      }
-    }
-
-    return JSON.stringify(data, null, 2)
-  }
-
-  importData(jsonString: string): { success: boolean; imported: number; errors: string[] } {
-    try {
-      const data = JSON.parse(jsonString)
-      const errors: string[] = []
-
-      // Validate import data structure
-      if (!data.data || !data.data.words || !Array.isArray(data.data.words)) {
-        throw new Error('Invalid import data format')
-      }
-
-      // Import words
-      const validWords: VocabularyWord[] = []
-      
-      data.data.words.forEach((word: any, index: number) => {
-        try {
-          // Ensure required fields exist
-          const validatedWord = VocabularyWordSchema.parse({
-            ...word,
-            id: word.id || crypto.randomUUID(),
-            createdAt: word.createdAt || new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            // Set default values for missing optional fields
-            phonetic: word.phonetic || '',
-            definitions: word.definitions || [word.meaning],
-            examples: word.examples || [],
-            synonyms: word.synonyms || [],
-            antonyms: word.antonyms || [],
-            tags: word.tags || [],
-            notes: word.notes || '',
-            imageUrl: word.imageUrl || '',
-            audioUrl: word.audioUrl || '',
-            lastReviewedAt: word.lastReviewedAt || null,
-            reviewCount: word.reviewCount || 0,
-            interval: word.interval || 0,
-            easeFactor: word.easeFactor || 2.5,
-            masteryScore: word.masteryScore || 0,
-            nextReviewAt: word.nextReviewAt || new Date().toISOString(),
-            isStarred: word.isStarred || false,
-            isArchived: word.isArchived || false
-          })
-          validWords.push(validatedWord)
-        } catch (error) {
-          errors.push(`Word ${index + 1}: ${error instanceof Error ? error.message : 'Invalid format'}`)
-        }
-      })
-
-      // Import sessions if valid
-      if (Array.isArray(data.data.sessions)) {
-        const validSessions: StudySession[] = []
-        
-        data.data.sessions.forEach((session: any, index: number) => {
-          try {
-            const validatedSession = StudySessionSchema.parse(session)
-            validSessions.push(validatedSession)
-          } catch (error) {
-            errors.push(`Session ${index + 1}: ${error instanceof Error ? error.message : 'Invalid format'}`)
-          }
-        })
-
-        if (validSessions.length > 0) {
-          this.setRaw(STORAGE_KEYS.SESSIONS, validSessions.slice(0, 100))
-        }
-      }
-
-      // Import settings if valid
-      if (data.data.settings) {
-        try {
-          const validatedSettings = AppSettingsSchema.parse(data.data.settings)
-          this.setRaw(STORAGE_KEYS.SETTINGS, validatedSettings)
-        } catch (error) {
-          errors.push(`Settings: ${error instanceof Error ? error.message : 'Invalid format'}`)
-        }
-      }
-
-      // Replace words with imported ones
-      this.setWords(validWords)
-
-      return {
-        success: errors.length === 0,
-        imported: validWords.length,
-        errors
-      }
-    } catch (error) {
-      throw new Error(`Import failed: ${error instanceof Error ? error.message : 'Invalid JSON format'}`)
-    }
-  }
-
-  clearAppData(): void {
-    try {
-      // Clear only app-specific data
-      Object.values(STORAGE_KEYS).forEach(key => {
-        localStorage.removeItem(key)
-      })
-      
-      // Clear cache
-      this.cache.clear()
-      this.writeQueue.clear()
-      
-      // Clear timeout
-      if (this.writeTimeout) {
-        clearTimeout(this.writeTimeout)
-      }
-      
-      // Reinitialize with defaults
-      this.initializeStorage()
-    } catch (error) {
-      console.error('Failed to clear app data:', error)
-      throw error
-    }
-  }
-
-  // ==================== STATISTICS ====================
-
-  getStats(): {
-    totalWords: number
-    activeWords: number
-    archivedWords: number
-    starredWords: number
-    dueForReview: number
-    totalSessions: number
-    totalReviews: number
-    averageMastery: number
-    storageUsage: string
-  } {
-    const words = this.getAllWords()
-    const sessions = this.getAllSessions()
-    
-    const totalWords = words.length
-    const activeWords = words.filter(w => !w.isArchived).length
-    const archivedWords = words.filter(w => w.isArchived).length
-    const starredWords = words.filter(w => w.isStarred).length
-    const dueForReview = words.filter(w => 
-      !w.isArchived && new Date(w.nextReviewAt) <= new Date()
-    ).length
-    
-    const totalSessions = sessions.length
-    const totalReviews = sessions.reduce((sum, session) => sum + session.totalCards, 0)
-    
-    const averageMastery = totalWords > 0 
-      ? Math.round(words.reduce((sum, word) => sum + word.masteryScore, 0) / totalWords)
-      : 0
-
-    // Calculate storage usage
-    let storageUsage = '0KB'
-    try {
-      const data = this.exportData()
-      storageUsage = `${Math.round(data.length / 1024)}KB`
-    } catch (error) {
-      // Ignore calculation errors
-    }
+    // Calculate next review date with some randomness for variety
+    const nextReviewAt = this.calculateNextReviewDate(newInterval)
 
     return {
-      totalWords,
-      activeWords,
-      archivedWords,
-      starredWords,
-      dueForReview,
-      totalSessions,
-      totalReviews,
-      averageMastery,
-      storageUsage
+      interval: newInterval,
+      easeFactor: parseFloat(newEaseFactor.toFixed(2)),
+      reviewCount: newReviewCount,
+      masteryScore: Math.round(newMasteryScore),
+      nextReviewAt: nextReviewAt.toISOString(),
+      lastReviewedAt: new Date().toISOString()
     }
   }
 
-  // ==================== CLEANUP ====================
-
-  forceSave(): void {
-    if (this.writeTimeout) {
-      clearTimeout(this.writeTimeout)
+  /**
+   * Calculate ease factor change based on quality rating
+   */
+  private static calculateEaseFactorChange(quality: number): number {
+    // Ease factor adjustments based on SM-2 algorithm
+    switch (quality) {
+      case 5: return 0.15
+      case 4: return 0.10
+      case 3: return 0.05
+      case 2: return -0.15
+      case 1: return -0.25
+      case 0: return -0.30
+      default: return 0
     }
-    this.flushWriteQueue()
   }
 
-  destroy(): void {
-    if (this.writeTimeout) {
-      clearTimeout(this.writeTimeout)
+  /**
+   * Clamp ease factor to reasonable bounds
+   */
+  private static clampEaseFactor(easeFactor: number): number {
+    return Math.max(
+      this.MIN_EASE_FACTOR,
+      Math.min(this.MAX_EASE_FACTOR, easeFactor)
+    )
+  }
+
+  /**
+   * Calculate mastery increment based on quality and current mastery
+   */
+  private static calculateMasteryIncrement(quality: number, currentMastery: number): number {
+    if (quality < 3) {
+      // Incorrect responses: mastery decreases, but less for higher mastery
+      const penaltyMultiplier = Math.max(0.3, 1 - (currentMastery / 100))
+      return -this.MASTERY_INCREMENT * penaltyMultiplier
     }
-    this.forceSave()
+
+    // Correct responses: mastery increases
+    let increment = this.MASTERY_INCREMENT * (quality / 5)
     
-    // Remove event listeners
-    if (typeof window !== 'undefined') {
-      window.removeEventListener('storage', () => {})
+    // Reduce increment as mastery approaches 100 (diminishing returns)
+    const difficultyFactor = 1 - (currentMastery / 100) * 0.7
+    return increment * difficultyFactor
+  }
+
+  /**
+   * Calculate next review date with some randomness
+   */
+  private static calculateNextReviewDate(intervalDays: number): Date {
+    const baseDate = new Date()
+    
+    // Add base interval
+    baseDate.setDate(baseDate.getDate() + intervalDays)
+    
+    // Add small random variation (±10% of interval or 1 day, whichever is smaller)
+    const randomVariation = Math.random() * 0.2 - 0.1 // ±10%
+    const variationDays = Math.round(intervalDays * randomVariation)
+    const maxVariation = Math.min(Math.abs(variationDays), 1)
+    const finalVariation = variationDays >= 0 ? maxVariation : -maxVariation
+    
+    baseDate.setDate(baseDate.getDate() + finalVariation)
+    
+    // Ensure at least tomorrow
+    const tomorrow = new Date()
+    tomorrow.setDate(tomorrow.getDate() + 1)
+    
+    return baseDate < tomorrow ? tomorrow : baseDate
+  }
+
+  /**
+   * Calculate performance consistency (standard deviation normalized)
+   */
+  private static calculateConsistency(accuracies: number[]): number {
+    if (accuracies.length < 2) return 0.5
+
+    const mean = accuracies.reduce((a, b) => a + b, 0) / accuracies.length
+    const variance = accuracies.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / accuracies.length
+    const stdDev = Math.sqrt(variance)
+    
+    // Convert to consistency score (0-1)
+    // Lower std dev = higher consistency
+    return Math.max(0, 1 - (stdDev / 50))
+  }
+
+  /**
+   * Calculate priority for review queue
+   * Higher priority = should be reviewed sooner
+   */
+  static getReviewPriority(card: VocabularyWord): number {
+    const now = new Date()
+    
+    // Days overdue (positive if overdue, negative if not yet due)
+    const daysOverdue = card.nextReviewAt
+      ? Math.max(0, (now.getTime() - new Date(card.nextReviewAt).getTime()) / (1000 * 60 * 60 * 24))
+      : 0
+
+    // Priority factors
+    const overdueWeight = Math.pow(daysOverdue + 1, 1.5) // Non-linear penalty for overdue cards
+    
+    const masteryWeight = (100 - card.masteryScore) / 100 // Lower mastery = higher priority
+    
+    const difficultyWeight = {
+      beginner: 0.8,
+      intermediate: 1.0,
+      advanced: 1.2,
+      master: 1.5
+    }[card.difficulty] || 1.0
+
+    const recencyPenalty = card.reviewCount === 0 ? 0.5 : 1.0 // New cards get slight penalty
+
+    // Combined priority score
+    return (overdueWeight * 2 + masteryWeight * 3) * difficultyWeight * recencyPenalty
+  }
+
+  /**
+   * Get summary of due cards
+   */
+  static getDueCardsSummary(cards: VocabularyWord[]): {
+    dueNow: number
+    dueToday: number
+    dueThisWeek: number
+    priorityQueue: VocabularyWord[]
+  } {
+    const now = new Date()
+    const endOfDay = new Date(now)
+    endOfDay.setHours(23, 59, 59, 999)
+    
+    const endOfWeek = new Date(now)
+    endOfWeek.setDate(endOfWeek.getDate() + 7)
+
+    let dueNow = 0
+    let dueToday = 0
+    let dueThisWeek = 0
+
+    // Calculate priority for each card
+    const cardsWithPriority = cards.map(card => ({
+      card,
+      priority: this.getReviewPriority(card)
+    }))
+
+    // Sort by priority (highest first)
+    cardsWithPriority.sort((a, b) => b.priority - a.priority)
+
+    cardsWithPriority.forEach(({ card }) => {
+      const nextReview = new Date(card.nextReviewAt)
+      
+      if (nextReview <= now) {
+        dueNow++
+      }
+      if (nextReview <= endOfDay) {
+        dueToday++
+      }
+      if (nextReview <= endOfWeek) {
+        dueThisWeek++
+      }
+    })
+
+    return {
+      dueNow,
+      dueToday,
+      dueThisWeek,
+      priorityQueue: cardsWithPriority.map(({ card }) => card)
+    }
+  }
+
+  /**
+   * Calculate optimal daily study goal based on user's performance and available time
+   */
+  static calculateDailyGoal(
+    totalWords: number,
+    dueWords: number,
+    averageStudyTime: number, // in seconds
+    availableTime: number, // in minutes
+    averageAccuracy: number // 0-100
+  ): number {
+    if (totalWords === 0) return 20 // Default goal for new users
+
+    // Base goal on due words (capped at 50)
+    let baseGoal = Math.min(dueWords, 50)
+    
+    // Adjust based on available time
+    const timeBasedGoal = Math.floor((availableTime * 60) / (averageStudyTime || 30))
+    
+    // Adjust based on performance (higher accuracy = can handle more)
+    const performanceMultiplier = 0.5 + (averageAccuracy / 100) * 0.5
+    
+    // Adjust based on total words (more words = higher goal, but with diminishing returns)
+    const totalWordsFactor = Math.min(Math.log10(totalWords + 1), 2)
+    
+    const recommended = Math.min(
+      Math.max(
+        10, // Minimum goal
+        Math.round(
+          (baseGoal * 0.4 + 
+           timeBasedGoal * 0.3 + 
+           totalWordsFactor * 15) * 
+          performanceMultiplier
+        )
+      ),
+      100 // Maximum goal
+    )
+    
+    return recommended
+  }
+
+  /**
+   * Adaptive learning based on performance history
+   */
+  static calculateOptimalReviewSchedule(
+    performanceHistory: Array<{
+      date: Date
+      accuracy: number // 0-100
+      responseTime: number // milliseconds
+      difficulty: string
+    }>,
+    currentCard: VocabularyWord
+  ): { nextInterval: number; confidence: number } {
+    if (performanceHistory.length === 0) {
+      return { nextInterval: 1, confidence: 0.5 }
+    }
+
+    // Calculate weighted average accuracy (recent performance weighted more)
+    const weightedAccuracy = performanceHistory.reduce((sum, entry, index) => {
+      const weight = Math.pow(0.9, performanceHistory.length - index - 1) // Exponential decay
+      return sum + entry.accuracy * weight
+    }, 0) / performanceHistory.reduce((sum, _, index) => 
+      sum + Math.pow(0.9, performanceHistory.length - index - 1), 0
+    )
+
+    // Calculate response time trend (slower = more difficult)
+    const recentResponseTimes = performanceHistory
+      .slice(-5)
+      .map(entry => entry.responseTime)
+    const avgResponseTime = recentResponseTimes.length > 0
+      ? recentResponseTimes.reduce((a, b) => a + b, 0) / recentResponseTimes.length
+      : 3000
+
+    // Determine optimal interval based on performance
+    let optimalInterval: number
+
+    if (weightedAccuracy > 90 && avgResponseTime < 2000) {
+      // Excellent performance - increase interval aggressively
+      optimalInterval = Math.round(currentCard.interval * 2.5)
+    } else if (weightedAccuracy > 80) {
+      // Good performance - normal increase
+      optimalInterval = Math.round(currentCard.interval * 2)
+    } else if (weightedAccuracy > 70) {
+      // Average performance - conservative increase
+      optimalInterval = Math.round(currentCard.interval * 1.5)
+    } else if (weightedAccuracy > 60) {
+      // Below average - minimal increase
+      optimalInterval = Math.round(currentCard.interval * 1.2)
+    } else {
+      // Poor performance - review soon
+      optimalInterval = Math.round(currentCard.interval * 1.1)
+    }
+
+    // Apply bounds (1 day to 1 year)
+    optimalInterval = Math.max(1, Math.min(365, optimalInterval))
+
+    // Calculate confidence score (0-1)
+    const consistencyScore = this.calculateConsistency(performanceHistory.map(p => p.accuracy))
+    const confidence = Math.min(1, 
+      (weightedAccuracy / 100) * 0.6 + 
+      consistencyScore * 0.3 + 
+      (avgResponseTime < 5000 ? 0.1 : 0)
+    )
+
+    return {
+      nextInterval: optimalInterval,
+      confidence: parseFloat(confidence.toFixed(2))
+    }
+  }
+
+  /**
+   * Initialize a new card with default spaced repetition values
+   */
+  static initializeCard(card: Omit<VocabularyWord, 
+    'interval' | 'easeFactor' | 'reviewCount' | 'masteryScore' | 
+    'nextReviewAt' | 'lastReviewedAt'
+  >): VocabularyWord {
+    return {
+      ...card,
+      interval: 1,
+      easeFactor: this.INITIAL_EASE_FACTOR,
+      reviewCount: 0,
+      masteryScore: 0,
+      nextReviewAt: new Date().toISOString(),
+      lastReviewedAt: new Date().toISOString()
+    }
+  }
+
+  /**
+   * Reset a card's progress while preserving word data
+   */
+  static resetCardProgress(card: VocabularyWord): VocabularyWord {
+    return {
+      ...card,
+      interval: 1,
+      easeFactor: this.INITIAL_EASE_FACTOR,
+      reviewCount: 0,
+      masteryScore: 0,
+      nextReviewAt: new Date().toISOString(),
+      lastReviewedAt: new Date().toISOString()
+    }
+  }
+
+  /**
+   * Calculate estimated time to mastery based on current progress
+   */
+  static estimateTimeToMastery(
+    currentMastery: number,
+    averageAccuracy: number,
+    reviewsPerDay: number
+  ): { days: number; reviews: number } {
+    if (currentMastery >= 95) {
+      return { days: 0, reviews: 0 }
+    }
+
+    // Estimate additional mastery points needed
+    const pointsNeeded = 100 - currentMastery
+    
+    // Estimate mastery gain per review based on accuracy
+    const averageGainPerReview = (averageAccuracy / 100) * 15
+    
+    // Account for diminishing returns at higher mastery levels
+    const diminishingFactor = 1 - (currentMastery / 100) * 0.5
+    
+    // Calculate required reviews
+    const reviewsNeeded = Math.ceil(pointsNeeded / (averageGainPerReview * diminishingFactor))
+    
+    // Calculate days needed
+    const daysNeeded = Math.ceil(reviewsNeeded / reviewsPerDay)
+    
+    return {
+      days: daysNeeded,
+      reviews: reviewsNeeded
     }
   }
 }
-
-export const storage = StorageService.getInstance()
