@@ -1,5 +1,5 @@
 // public/sw.js
-const CACHE_NAME = 'vocabulary-master-v1.0.0';
+const CACHE_NAME = 'vocabulary-master-v1.2.0';
 const DYNAMIC_CACHE_NAME = 'vocabulary-master-dynamic-v1.0.0';
 
 // Assets to cache on install
